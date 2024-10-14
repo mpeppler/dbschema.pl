@@ -38,7 +38,8 @@
 
 
 use strict;
-use Sybase::DBlib;
+#use Sybase::DBlib;
+use DBI;
 use Getopt::Long;
 use English;
 
@@ -82,9 +83,9 @@ sub showVersion;
 sub getSrvVersion;
 sub printSrvVersion;
 
-my($VERSION) = "2.4.2";
+my($VERSION) = "3.0";
 
-my($dbproc, @dat);
+my($dbh, @dat);
 my(%udflt, %urule);          # Global for a reason :-(
 my($date);
 my($suffix);
@@ -374,53 +375,48 @@ if (!$Password) {
     }
 }
 
+
+# Connect to Sybase and the set any database paramaters.
+
+my $url = "dbi:Sybase:sercer=$Server";
+
 # They are allowed an alternative interfaces file if they so wish...
 
-if($interfacesFile) {
-    dbsetifile($interfacesFile);
+if ($interfacesFile) {
+  $url .= ":interfaces=$interfacesFile";
 }
 
 # ...or character set...
 
 if ($charset) {
-    DBSETLCHARSET($charset);
+  $url .= ":charset=$charset";
 }
 
 # ...or locale...
 
 if ($language) {
-    DBSETLNATLANG($language);
+  $url .= ":language=$language";
 }
 
 # ...or packet size.  If they try to set this greater than the server's
 # max, the script will fail.
 
 if ($packet_size) {
-  Sybase::DBlib::DBSETLPACKET($packet_size);
+  $url .= ":packetSize=$packet_size";
 }
 
-# Connect to Sybase and the set any database paramaters.
-
-if (!($dbproc = new Sybase::DBlib ("$User",
-                                   "$Password",
-                                    $Server))) {
-    die("Cannot connect to server.\n");
-}
+$dbh = DBI->connect($url, $User, $Password, {RaiseError => 1});  # for now, exit on failure.
 
 # We need a version string so that we can make some of the bits of the
 # script optional.
 
 $srvVersion = getSrvVersion();
 
-# Just in case you compiled with dbNullIsUndef defaulting to FALSE
-
-$dbproc->{"dbNullIsUndef"} = TRUE;
-
 # Build the set of databases to extract.
 
 if ($allUserDatabases) {
 
-    $dbproc->dbcmd(qq{
+  @databases = dbListOfScalar($dbh, qq{
 
         SELECT db.name
           FROM master.dbo.sysdatabases db
@@ -430,17 +426,10 @@ if ($allUserDatabases) {
            AND db.name NOT LIKE \'\%RSSD\'
 
            });
-
-    $dbproc->dbsqlexec;
-    $dbproc->dbresults;
-
-    while ((@dat = $dbproc->dbnextrow)) {
-        push(@databases, $dat[0]);
-    }
 }
 elsif ($allDatabases) {
 
-    $dbproc->dbcmd(qq{
+  @databases = dbListOfScalar($dbh, qq{
 
         SELECT db.name
           FROM master.dbo.sysdatabases db
@@ -448,13 +437,6 @@ elsif ($allDatabases) {
                                       -- the consequences.
 
                                     });
-
-    $dbproc->dbsqlexec;
-    $dbproc->dbresults;
-
-    while ((@dat = $dbproc->dbnextrow)) {
-        push(@databases, $dat[0]);
-    }
 }
 
 # Remove a trailing ".sql" from the prefix if it is there.
@@ -529,7 +511,10 @@ foreach $database (@databases) {
 
     verifyDirectories if $splitLevel == 2;
 
-    next DATABASE if !$dbproc->dbuse($database);
+    # With RaiseError this will cause the script to exit rather than going to the
+    # next database in the list, so either remove the RaiseError in the connect string
+    # above, or use a try/catch logic here.
+    next DATABASE if !$dbh->do("use $database");
 
     if ($generateBCP) {
         # Set up the name for the bcp extraction.
@@ -629,7 +614,44 @@ close(SCRIPT);
 close(LOG);
 close(ERR);
 
-dbexit;
+exit(0);
+
+#---------------------------#
+# Database Utility routines # 
+#---------------------------#
+
+sub dbListOfScalar {
+  my ($dbh, $sql) = @_;
+
+  my $sth = $dbh->prepare($sql);
+  $sth->execute;
+  my @dat;
+  {
+    while(my $d = $sth->fetch) {
+      push(@dat, $d->[0]);
+    }
+    redo if ($sth->{syb_more_results});
+  } 
+
+  return @dat;
+}
+
+sub dbListOfList {
+  my ($dbh, $sql) = @_;
+
+  my $sth = $dbh->prepare($sql);
+  $sth->execute;
+  my @dat;
+  {
+    while(my $d = $sth->fetch) {
+      push(@dat, [@$d]);
+    }
+    redo if ($sth->{syb_more_results});
+  } 
+
+  return @dat;
+}
+
 
 #-------------------------#
 # Subroutine definitions. #
@@ -657,11 +679,12 @@ sub getPerms {
     my ($ret, @dat, $cnt);
     my ($action, $permsaffected, $cols, $user);
 
-    $dbproc->dbcmd("exec sp_helprotect '$obj'\n");
-    $dbproc->dbsqlexec;
+    my $sth = $dbh->prepare("exec sp_helprotect '$obj'\n");
+    $sth->execute();
 
     $cnt = 0;
-    while (($ret = $dbproc->dbresults) != NO_MORE_RESULTS && $ret != FAIL) {
+
+    {
         while (@dat = $dbproc->dbnextrow) {
 
             if ($cnt == 0) {
@@ -698,6 +721,8 @@ sub getPerms {
                 $user          = $dat[1];
             }
         }
+
+        redo if ($sth->{syb_more_results});
     }
 
     if ($cnt > 0) {
@@ -738,7 +763,7 @@ sub getObj {
     #       issue a warning.  FIXME
 
     if ($obj eq "P" && !$for_compare) {
-        $dbproc->dbcmd(qq{
+      @items = dbListOfList$dbh, qq{
 
             SELECT DISTINCT
                    o1.name,
@@ -781,7 +806,7 @@ sub getObj {
                });
 
     } else {
-        $dbproc->dbcmd (qq{
+      @items = dbListOfList($dbh, qq{
 
             SELECT DISTINCT
                    o.name,
@@ -798,13 +823,6 @@ sub getObj {
              ORDER BY o.name
 
              });
-    }
-
-    $dbproc->dbsqlexec;
-    $dbproc->dbresults;
-
-    while ((@dat = $dbproc->dbnextrow)) {
-        push (@items, [ @dat ]);    # and save it in a list
     }
 
     # If there are no objects, and we are extracting each object into its
@@ -871,7 +889,7 @@ sub getObj {
         # 2002/03/12: mmertel added number and colid to support stored
         # procedure grouping
 
-        $dbproc->dbcmd(qq{
+        my $sth = $dbh->prepare(qq{
 
             SELECT number, colid, text
               FROM dbo.syscomments
@@ -879,10 +897,10 @@ sub getObj {
 
                 });
 
-        $dbproc->dbsqlexec;
-        $dbproc->dbresults;
+        $sth->execute();
 
-        while(($number,$colid,$text) = $dbproc->dbnextrow) {
+        #verify the fetchrow() call.
+        while(($number,$colid,$text) = $sth->fetchrow()) {
             # 03/12/2002: mmertel added a 'go' if this is the first line of
             # a new proc within a stored procedure group
             putScript("$cmdend\n") if $obj eq 'P' && $number > 1 and $colid == 1;
@@ -891,6 +909,8 @@ sub getObj {
 
             $last_line = $text;
         }
+
+        $sth->finish();
 
         # Did the last $text include a carriage return, if not add one.
         # This seems a little pedantic, but if you have seen the way that
@@ -956,15 +976,16 @@ sub extractTables {
 
      };
 
-    $dbproc->dbcmd($sql_text);
+    my $sth = $dbh->prepare($sql_text);
 
-    $dbproc->dbsqlexec;
-    $dbproc->dbresults;
+    $sth->execute();
 
-    while (@dat = $dbproc->dbnextrow) {
+    while (@dat = $sth->fetchrow_array()) {
         $tables{$dat[1] . "." . $dat[0]} = [ @dat ];
         @tabnames = ( @tabnames, $dat[1] . "." . $dat[0] );
     }
+
+    $sth->finish();
 
     foreach $name (@tabnames) {
         dumpTable($database, \%tables, $tables{$name}, ());
@@ -1007,7 +1028,7 @@ sub extractIndexes {
         putScript("/* Indexes... */\n\n");
     }
 
-    $dbproc->dbcmd(qq{
+    my $sth = $dbh->prepare(qq{
 
         SELECT o.name,
                u.name,
@@ -1021,12 +1042,13 @@ sub extractIndexes {
 
          });
 
-    $dbproc->dbsqlexec;
-    $dbproc->dbresults;
+    $sth->execute();
 
-    while (@fields = $dbproc->dbnextrow) {
+    while (@fields = $sth->fetchrow_array()) {
         push(@rows, [ @fields ]);
     }
+
+    $sth->finish();
 
     foreach $row (@rows) {
 
@@ -1057,7 +1079,7 @@ sub extractFkeys {
         putScript("/* Foreign Key Constraints... */\n\n");
     }
 
-    $dbproc->dbcmd(qq{
+    my $sth->prepare(qq{
 
         SELECT isnull (r.frgndbname, \'$database\'),
                object_name (r.constrid),
@@ -1110,12 +1132,11 @@ sub extractFkeys {
 
          });
 
-    $dbproc->dbsqlexec;
-    $dbproc->dbresults;
+    $sth->execute();
 
     my (@refcols, $refname);
     my ($tabname, $tabname_prev) = ('', '');
-    while ((@refcols = $dbproc->dbnextrow)) {
+    while ((@refcols = $sth->fetchrow_array())) {
 
         ++$Stats{'References'};
 
@@ -1168,6 +1189,8 @@ sub extractFkeys {
         }
 
     }
+
+    $sth->finish();
 
     if ($tabname) {
         putScript("\nEND");
@@ -1253,7 +1276,7 @@ sub extractTypes {
 
     putScript("/* Add user-defined data types: */\n\n") if $comments;
 
-    $dbproc->dbcmd(qq{
+    my $sth->prepare(qq{
 
         SELECT s.length,
                s.name,
@@ -1273,11 +1296,9 @@ sub extractTypes {
 
            });
 
-    $dbproc->dbsqlexec;
-    $dbproc->dbresults;
+    $sth->execute();
 
-
-    while ((@dat = $dbproc->dbnextrow)) {
+    while ((@dat = $sth->fetchrow_array())) {
         ++$Stats{'Types'};
 
         # FIXME: Should deal with the '...n' types as per table extraction.
@@ -1307,6 +1328,8 @@ sub extractTypes {
 
         $putGo = 1;
     }
+
+    $sth->finish();
 
     if ($putGo) {
         putScript("$cmdend\n");
@@ -1390,7 +1413,7 @@ sub extractViews {
     }
     else {
 
-        $dbproc->dbcmd(qq{
+        my $sth->prepare(qq{
 
             SELECT o.name,
                    u.name,
@@ -1405,14 +1428,15 @@ sub extractViews {
 
          });
 
-        $dbproc->dbsqlexec;
-        $dbproc->dbresults;
+        $sth->execute();
 
-        while (@data = $dbproc->dbnextrow) {
+        while (@data = $sth->fetchrow_array()) {
             $views{$data[1] . "." . $data[0]} = [ @data ];
 
             push(@viewnames, $data[1] . "." . $data[0]);
         }
+
+        $sth->finish();
 
         foreach $view (@viewnames) {
             dumpView($database, \%views, $views{$view}, ());
@@ -1441,7 +1465,7 @@ sub extractKeys {
 
     putScript("\nsetuser 'dbo'\n$cmdend\n") if $setuser;
 
-    $dbproc->dbcmd (qq{
+    my $sth = $dbh->prepare (qq{
 
         SELECT keytype        = convert(char(10), v.name),
                object         = object_name(k.id),
@@ -1475,10 +1499,9 @@ sub extractKeys {
          });
 
 
-    $dbproc->dbsqlexec;
-    $dbproc->dbresults;
+    $sth->execute();
 
-    while ((@dat = $dbproc->dbnextrow)) {
+    while ((@dat = $sth->fetchrow_array())) {
 
       ++$Stats{'Keys'};
 
@@ -1519,6 +1542,8 @@ sub extractKeys {
         logMessage("done.\n") if $verbose > 1;
     }
 
+    $sth->finish();
+
     logMessage("done.\n") if $verbose > 0;
 }
 
@@ -1540,7 +1565,7 @@ sub extractGroups {
     # Allow 'sa' to use the master table and regular users to simply access
     # local stuff.  Should work.  Do we actually need the first one?
 
-    $dbproc->dbcmd(qq{
+    my $sth = $dbh->prepare(qq{
 
         IF (proc_role(\'sa_role\') = 1)
             SELECT name
@@ -1560,9 +1585,10 @@ sub extractGroups {
                                 WHERE sr.lrid = su.gid)
             });
 
-    $dbproc->dbsqlexec;
+    $sth->execute();
 
-    while (($ret = $dbproc->dbresults) != NO_MORE_RESULTS && $ret != FAIL) {
+#    while (($ret = $dbproc->dbresults) != NO_MORE_RESULTS && $ret != FAIL) {
+      {
         while (@dat = $dbproc->dbnextrow) {
             ++$Stats{'Groups'};
 
@@ -1571,7 +1597,11 @@ sub extractGroups {
 
             logMessage("Extracting group '$dat[0]'.\n") if $verbose > 1;
         }
+
+        redo if $sth->{syb_more_results};
     }
+
+    $sth->finish();
 
     if ($putGo) {
         putScript("$cmdend\n");
@@ -1599,7 +1629,7 @@ sub extractUsers {
     # The outer join allows for the extraction of the guest user, if it has
     # been defined in a database.
 
-    $dbproc->dbcmd(qq{
+    my $sth = $dbh->prepare(qq{
 
         SELECT
             sl.name,
@@ -1617,10 +1647,9 @@ sub extractUsers {
 
         });
 
-    $dbproc->dbsqlexec;
-    $dbproc->dbresults;
+    $sth->execute();
 
-    while (@dat = $dbproc->dbnextrow) {
+    while (@dat = $sth->fetchrow_array()) {
       ++$Stats{'Users'};
 
       $dat[0] = $dat[0] || $dat[1];
@@ -1630,6 +1659,8 @@ sub extractUsers {
 
       logMessage("Extracting user '$dat[1]' (login '$dat[0]')\n") if $verbose > 1;
     }
+
+    $sth->finish();
 
     if ($putGo) {
         putScript("$cmdend\n");
@@ -1654,7 +1685,7 @@ sub extractAliases {
 
     putScript("\n/* Aliases... */\n\n") if $comments;
 
-    $dbproc->dbcmd(qq{
+    my $sth = $dbh->prepare(qq{
 
         SELECT sl.name,
                su.name
@@ -1666,10 +1697,9 @@ sub extractAliases {
 
            });
 
-    $dbproc->dbsqlexec;
-    $dbproc->dbresults;
+    $sth->execute();
 
-    while (@dat = $dbproc->dbnextrow) {
+    while (@dat = $sth->fetchrow_array()) {
       ++$Stats{'Aliases'};
 
       putScript("exec sp_addalias '$dat[0]', '$dat[1]'\n");
@@ -1677,6 +1707,8 @@ sub extractAliases {
 
       logMessage("Extracting alias '$dat[0]' (aliased to '$dat[1]')\n") if $verbose > 1;
     }
+
+    $sth->finish();
 
     if ($putGo) {
         putScript("$cmdend\n\n");
@@ -1702,7 +1734,7 @@ sub extractLogins {
 
     # Ignore public and all roles.
 
-    $dbproc->dbcmd(qq{
+    my $sth = $dbh->prepare(qq{
 
         SELECT name,
                dbname
@@ -1711,16 +1743,17 @@ sub extractLogins {
 
                   });
 
-    $dbproc->dbsqlexec;
-    $dbproc->dbresults;
+    $sth->execute();
 
-    while (@dat = $dbproc->dbnextrow) {
+    while (@dat = $sth->fetchrow_array()) {
 
       ++$Stats{'Logins'};
 
       putScript("exec sp_addlogin '$dat[0]', 'DUMMYPASS', '$dat[1]'\n");
       $putGo = 1;
     }
+
+    $sth->finish();
 
     if ($putGo) {
         putScript("$cmdend\n");
@@ -1745,7 +1778,7 @@ sub getComment {
 
     my ($line, $text);
 
-    $dbproc->dbcmd(qq{
+    my $sth = $dbh->prepare(qq{
 
         SELECT text
         FROM dbo.syscomments
@@ -1753,14 +1786,15 @@ sub getComment {
 
         });
 
-    $dbproc->dbsqlexec;
-    $dbproc->dbresults;
+    $sth->execute();
 
     $text = "";
 
-    while (($line) = $dbproc->dbnextrow) {
-        $text = $text . $line if $line;
+    while ($line = $sth->fetchrow) {
+        $text = $text . $line[0] if $line[0];
     }
+
+    $sth->finish();
 
     return $text;
 }

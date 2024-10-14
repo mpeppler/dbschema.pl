@@ -1,3 +1,6 @@
+Release 3.0
+  Date to be Confirmed - Port to use DBD::Sybase instead of Sybase::DBlib
+
 Release 2.5
   2009/04/03 - ASE 15 related fixes/upgrades.  Fixed bad table partition
                counts for ASE 15.  Added support for "unsigned" int data
