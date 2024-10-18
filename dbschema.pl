@@ -1893,7 +1893,7 @@ sub dumpTable {
     # and so it is poss to have more foreign and referential keys.
 
     if ($splitLevel != 2 && !$for_compare) {
-        $dbproc->dbcmd (qq{
+        my $sth = $dbh->prepare( qq{
 
             SELECT isnull (r.frgndbname, \'$database\'),
                    object_name (r.constrid),
@@ -1943,12 +1943,12 @@ sub dumpTable {
 
                });
 
-        $dbproc->dbsqlexec;
-        $dbproc->dbresults;
+        $sth->execute();
 
-        while ((@refcols = $dbproc->dbnextrow)) {
+        while ((@refcols = $sth->fetchrow_array())) {
             push (@reflist, [ @refcols ]);
         }
+        $sth->finish();
 
         foreach (@reflist) {
 
@@ -2029,7 +2029,7 @@ sub dumpTable {
         putScript("$cmdend\n");
     }
 
-    $dbproc->dbcmd(qq{
+    my $sth->prepare(qq{
 
         SELECT sysstat2
           FROM dbo.sysobjects
@@ -2037,16 +2037,17 @@ sub dumpTable {
 
          });
 
-    $dbproc->dbsqlexec;
-    $dbproc->dbresults;
+    $sth->execute();
 
-    while (@field = $dbproc->dbnextrow) {
+    while (@field = $sth->fetchrow_array()) {
         $sysstat2 = $field[0];
     }
 
+    $sth->finish();
+
     if (($sysstat2 & 1024) == 1024) { # CIS Table
         if ($cis) {  # Automatically false for SQL Server.
-            $dbproc->dbcmd(qq{
+            my $sth = $dbh->prepare(qq{
 
                 SELECT char_value
                   FROM sysattributes
@@ -2056,12 +2057,13 @@ sub dumpTable {
 
                    });
 
-            $dbproc->dbsqlexec;
-            $dbproc->dbresults;
+            $sth->execute();
 
-            while (@field = $dbproc->dbnextrow) {
+            while (@field = $sth->fetchrow_array()) {
                 $external_ref = $field[0];
             }
+
+            $sth->finish();
 
             logError($database, "Found CIS table: $fullname -> $external_ref\n");
 
@@ -2074,7 +2076,7 @@ sub dumpTable {
         }
     }
 
-    $dbproc->dbcmd(qq{
+    my $sth = $dbh->prepare(qq{
 
         SELECT DISTINCT
                Column_name  = c.name,
@@ -2104,8 +2106,7 @@ sub dumpTable {
 
          });
 
-    $dbproc->dbsqlexec;
-    $dbproc->dbresults;
+    $sth->execute();
 
     undef(%rule);
     undef(%dflt);
@@ -2124,7 +2125,7 @@ sub dumpTable {
     $maxColLength = 0;
     $maxTypLength = 0;
 
-    while (@field = $dbproc->dbnextrow) {
+    while (@field = $sth->fetchrow_array()) {
 
         if ($field[1] eq "intn") {
             $field[1] = $old_type[$field[2]];
@@ -2167,6 +2168,8 @@ sub dumpTable {
 
         $maxTypLength = max($thisTypLength, $maxTypLength);
     }
+
+    $sth->finish();
 
     # There needs to be an option to allow people to upper case the types,
     # nullity and other bits.
@@ -2342,7 +2345,7 @@ sub dumpTable {
 
     @constrids = ();
 
-    $dbproc->dbcmd(qq{
+    my $sth = $dbh->prepare(qq{
 
         SELECT constrid
           FROM dbo.sysconstraints
@@ -2352,12 +2355,13 @@ sub dumpTable {
 
            });
 
-    $dbproc->dbsqlexec;
-    $dbproc->dbresults;
+    $sth->execute();
 
-    while (@field = $dbproc->dbnextrow) {
+    while (@field = $$sth->fetchrow_array()) {
         @constrids = (@constrids, $field[0]);
     }
+
+    $sth->finish();
 
     foreach $constrid (@constrids) {
         putScript(",\n    " . getComment ($constrid));
@@ -2373,7 +2377,7 @@ sub dumpTable {
         # backwards compatible since these bits are not set prior to
         # 11.9, so we will obtain the default result.)
 
-        $dbproc->dbcmd (qq{
+        my $sth = $dbh->prepare (qq{
 
             -- Select the relevant bits.
             --
@@ -2389,10 +2393,11 @@ sub dumpTable {
 
                  });
 
-        $dbproc->dbsqlexec;
+        $sth->execute();
 
-        while (($ret = $dbproc->dbresults) != NO_MORE_RESULTS && $ret != FAIL) {
-            while (@answerlock = $dbproc->dbnextrow) {
+        {
+        #while (($ret = $dbproc->dbresults) != NO_MORE_RESULTS && $ret != FAIL) {
+            while (@answerlock = $sth->fetchrow_array()) {
                 $rowlock = $answerlock[0];
                 if ($rowlock == 16384) {
                     putScript("\nLOCK DATAPAGES");
@@ -2400,7 +2405,11 @@ sub dumpTable {
                     putScript("\nLOCK DATAROWS");
                 }
             }
+
+            redo if($sth->{syb_more_results});
         }
+
+        $sth->finish();
 
         # If the locking scheme is DOL (pages or rows), then add the
         # expected row size figure.
@@ -2409,7 +2418,7 @@ sub dumpTable {
             $rowlock == 32768) {
 
             if ($splitLevel != 1) {
-                $dbproc->dbcmd (qq{
+                my $sth = $dbh->prepare (qq{
 
                     SELECT exp_rowsize,
                            res_page_gap,
@@ -2421,15 +2430,19 @@ sub dumpTable {
 
                        });
 
-                $dbproc->dbsqlexec;
+                $sth->execute();
 
-                while (($ret = $dbproc->dbresults) != NO_MORE_RESULTS && $ret != FAIL) {
-                    while (@expRowSize = $dbproc->dbnextrow) {
+                #while (($ret = $dbproc->dbresults) != NO_MORE_RESULTS && $ret != FAIL) {
+                {
+                    while (@expRowSize = $sth->fetchrow_array()) {
                         if ($expRowSize[0] > 0) {
                             putScript("\nWITH EXP_ROW_SIZE = $expRowSize[0]");
                         }
                     }
+
+                    redo if ($sth->{syb_more_results});
                 }
+                $sth->finish;
             }
         }
     }
@@ -2438,7 +2451,7 @@ sub dumpTable {
 
     @segment = undef;
 
-    $dbproc->dbcmd (qq{
+    my $sth = $dbh->prepare (qq{
 
         IF EXISTS (SELECT 1
                      FROM sysobjects
@@ -2458,13 +2471,16 @@ sub dumpTable {
 
         });
 
-    $dbproc->dbsqlexec;
+    $sth->execute();
 
-    while (($ret = $dbproc->dbresults) != NO_MORE_RESULTS && $ret != FAIL) {
-        while (@segment = $dbproc->dbnextrow) {
+    #while (($ret = $dbproc->dbresults) != NO_MORE_RESULTS && $ret != FAIL) 
+    {
+        while (@segment = $sth->fetchrow_array()) {
             putScript("\nON $segment[0]");
         }
+        redo if ($sth->{syb_more_results});
     }
+    $sth->finish();
 
     putScript("\n$cmdend\n\n");   # end of CREATE TABLE
 
@@ -2480,7 +2496,7 @@ sub dumpTable {
     # all releases of ASE, so check to see if syspartions exists
     # first.  Not available in this form at all in SQL Server.
 
-    $dbproc->dbcmd (qq{
+    my $sth = $dbh->prepare (qq{
 
         IF EXISTS (SELECT 1
                      FROM sysobjects
@@ -2492,19 +2508,24 @@ sub dumpTable {
 
             });
 
-    $dbproc->dbsqlexec;
+    $sth->execute();
 
-    while (($ret = $dbproc->dbresults) != NO_MORE_RESULTS && $ret != FAIL) {
-        while (@answer = $dbproc->dbnextrow) {
+    #while (($ret = $dbproc->dbresults) != NO_MORE_RESULTS && $ret != FAIL) 
+    {
+        while (@answer = $sth->fetchrow_array()) {
             $partition = $answer[0];
             $int_version = $answer[1];
         }
+        redo if ($sth->{syb_more_results});
     }
 
+    $sth->finish();
+
     if ($partition) {
+
         # syspartitions table completely changed for ASE 15 & above
         if( $int_version < 15000 ) {
-	    $dbproc->dbcmd (qq{
+      	    $sth = $dbh->prepare (qq{
 
 		SELECT COUNT(*)
 		  FROM syspartitions
@@ -2512,7 +2533,7 @@ sub dumpTable {
 
 		 });
         } else {
-            $dbproc->dbcmd (qq{
+            $sth = $dbh->prepare (qq{
 
                 SELECT COUNT(DISTINCT(partitionid))
                   FROM syspartitions
@@ -2521,10 +2542,9 @@ sub dumpTable {
                  });
         }
 
-        $dbproc->dbsqlexec;
-        $dbproc->dbresults;
+        $sth->execute();
 
-        while (@partitions = $dbproc->dbnextrow) {
+        while (@partitions = $sth->fetchrow_array()) {
             # Note, 1 partition is allowed in ASE 15, but not in ASE 12.5.x and lower
             if ($partitions[0] > 1) {
                 if ($for_sql_server) {
@@ -2546,6 +2566,7 @@ sub dumpTable {
                 }
             }
         }
+        $sth->finish();
     }
 
     # Only add the indexes to this script if the user has not specified
